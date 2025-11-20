@@ -19,6 +19,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# 本脚本定义了Gemma模型的配置类GemmaConfig。Gemma是Google开发的一种大型语言模型。
+# 该配置类用于存储和管理Gemma模型的各种参数设置，如词汇表大小、隐藏层维度、注意力头数量等。
+# 通过这个配置类，用户可以初始化一个符合特定需求的Gemma模型实例，并控制模型的行为和输出。
+# 该文件是自动从modular_gemma.py生成的，不应直接编辑，任何修改都应当在原始的modular_gemma.py文件中进行
+
 from typing import Optional
 from ...configuration_utils import PretrainedConfig
 
@@ -95,49 +101,58 @@ class GemmaConfig(PretrainedConfig):
     >>> configuration = model.config
     ```"""
 
-    model_type = "gemma"
-    keys_to_ignore_at_inference = ["past_key_values"]
+    model_type = "gemma"    # 模型类型标识符
+    keys_to_ignore_at_inference = ["past_key_values"]   # 推理时要忽略的键列表
+    # 张量并行计划，定义了模型各层的并行策略
     base_model_tp_plan = {
-        "layers.*.self_attn.q_proj": "colwise",
-        "layers.*.self_attn.k_proj": "colwise",
-        "layers.*.self_attn.v_proj": "colwise",
-        "layers.*.self_attn.o_proj": "rowwise",
-        "layers.*.mlp.gate_proj": "colwise",
-        "layers.*.mlp.up_proj": "colwise",
-        "layers.*.mlp.down_proj": "rowwise",
+        "layers.*.self_attn.q_proj": "colwise", # 自注意力层的查询投影层使用列并行
+        "layers.*.self_attn.k_proj": "colwise",  # 自注意力层的键投影层使用列并行
+        "layers.*.self_attn.v_proj": "colwise",  # 自注意力层的值投影层使用列并行
+        "layers.*.self_attn.o_proj": "rowwise",  # 自注意力层的输出投影层使用行并行
+        "layers.*.mlp.gate_proj": "colwise",    # 多层感知机层的门投影层使用列并行
+        "layers.*.mlp.up_proj": "colwise",       # 多层感知机层的上投影层使用列并行
+        "layers.*.mlp.down_proj": "rowwise",     # 多层感知机层的下投影层使用行并行
     }
+    # 流水线并行计划，定义了模型各组件的输入输出
     base_model_pp_plan = {
-        "embed_tokens": (["input_ids"], ["inputs_embeds"]),
-        "layers": (["hidden_states", "attention_mask"], ["hidden_states"]),
-        "norm": (["hidden_states"], ["hidden_states"]),
+        "embed_tokens": (["input_ids"], ["inputs_embeds"]), # 嵌入层的输入输出
+        "layers": (["hidden_states", "attention_mask"], ["hidden_states"]), # Transformer层的输入输出
+        "norm": (["hidden_states"], ["hidden_states"]),     # 归一化层的输入输出
     }
 
     def __init__(
         self,
-        vocab_size=256000,
-        hidden_size=3072,
-        intermediate_size=24576,
-        num_hidden_layers=28,
-        num_attention_heads=16,
-        num_key_value_heads=16,
-        head_dim=256,
-        hidden_act="gelu_pytorch_tanh",
-        hidden_activation=None,
-        max_position_embeddings=8192,
-        initializer_range=0.02,
-        rms_norm_eps=1e-6,
-        use_cache=True,
-        pad_token_id=0,
-        eos_token_id=1,
-        bos_token_id=2,
-        tie_word_embeddings=True,
-        rope_theta=10000.0,
-        attention_bias=False,
-        attention_dropout=0.0,
-        use_adarms: bool = False,
-        adarms_cond_dim: Optional[int] = None,
+        vocab_size=256000,  # 词汇表大小
+        hidden_size=3072,   # 隐藏层维度
+        intermediate_size=24576,    # 中间层维度
+        num_hidden_layers=28,   # 隐藏层数量
+        num_attention_heads=16, # 注意力头数量
+        num_key_value_heads=16, # 键值注意力头数量
+        head_dim=256,           # 注意力头维度
+        hidden_act="gelu_pytorch_tanh", # 隐藏层激活函数
+        hidden_activation=None, # 隐藏层激活函数（优先级高于hidden_act）
+        max_position_embeddings=8192,   # 最大位置嵌入长度
+        initializer_range=0.02, # 初始化范围
+        rms_norm_eps=1e-6,  # RMS归一化的epsilon值
+        use_cache=True, # 是否使用缓存
+        pad_token_id=0, # 填充标记ID
+        eos_token_id=1, # 结束标记ID
+        bos_token_id=2, # 开始标记ID
+        tie_word_embeddings=True,   # 是否绑定词嵌入
+        rope_theta=10000.0, # RoPE嵌入的基本周期
+        attention_bias=False,   # 是否在注意力层使用偏置
+        attention_dropout=0.0,  # 注意力丢弃率
+        use_adarms: bool = False,   # 是否使用ADARMS
+        adarms_cond_dim: Optional[int] = None,  # ADARMS条件维度
         **kwargs,
     ):
+        """
+        初始化GemmaConfig配置对象
+        输入：
+            所有参数都在英文文档字符串中有详细说明
+        输出：
+            无返回值，初始化配置对象的属性
+        """
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size
@@ -170,4 +185,4 @@ class GemmaConfig(PretrainedConfig):
         )
 
 
-__all__ = ["GemmaConfig"]
+__all__ = ["GemmaConfig"]   # d定义模块的公共接口，导出GemmaConfig类

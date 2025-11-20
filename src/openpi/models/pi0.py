@@ -189,28 +189,111 @@ class Pi0(_model.BaseModel):
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
+        """
+        计算模型的损失函数
+        参数:
+            rng (at.KeyArrayLike): JAX随机数生成器，用于生成噪声和采样时间同步
+            observation (_model.Observation): 环境观察数据，包含图像、状态等信息
+            actions (_model.Actions): 动作序列，形状为 [batch_size, action_horizon, action_dim]
+            train (bool, optional): 是否为训练模式，默认为False。影响数据预处理和dropout等行为
+
+        返回:
+            at.Float[at.Array, "*b ah"]: 每个样本的损失值，形状为 [batch_size, action_horizon]
+        实现细节：
+        1. 添加噪声到动作序列
+        2. 预测噪声
+        3. 计算MSE损失
+        """
+        # 将随机数生成器分成三份，分别用于预处理、生成噪声和采样时间同步
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+        # 预处理观察数据（图像、状态等）
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
-        batch_shape = actions.shape[:-2]
-        noise = jax.random.normal(noise_rng, actions.shape)
+        batch_shape = actions.shape[:-2]    # 获取batch_size，排除最后两个维度action_horizon和action_dim
+        noise = jax.random.normal(noise_rng, actions.shape) # 生成与动作序列相同形状的高斯噪声
+        
+        # 使用beta分布采样时间步，范围在0.001到1之间
+        # beta（1.5,1）分布偏向于较大的值，这有助于模型更好的学习去噪过程
         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
+        # 扩展时间维度，使其与动作序列维度匹配
         time_expanded = time[..., None, None]
+        
+        # 实现了扩散模型的前向过程：计算带噪声的动作序列 x_t
+        # 1. time_expanded 是时间步 t 的扩展，范围在 (0.001, 1.0) 之间
+        # 2. 当 t 接近 1 时，x_t 主要由噪声组成
+        # 3. 当 t 接近 0 时，x_t 主要由原始动作组成
+        # 4. 这种线性插值确保了平滑的扩散过程
         x_t = time_expanded * noise + (1 - time_expanded) * actions
+        
+        # 计算模型需要预测的目标值 u_t
+        # 在扩散模型中，我们不是直接预测噪声，而是预测噪声与原始动作的差异
+        # 1. noise - actions 表示噪声与原始动作的差异
+        # 2. 这个差异值 u_t 作为模型的学习目标
+        # 3. 在推理时，模型预测这个差异值，然后通过 x_t - u_t 来恢复原始动作
+        # 4. 这种设计使得模型可以更好地学习去噪过程，因为它直接学习噪声与原始动作的关系
         u_t = noise - actions
 
         # one big forward pass of prefix + suffix at once
+        # 处理模型的前缀部分（视觉和语言输入）
+        # prefix_mask    存储每个输入的掩码，用于标记哪些位置是有效的输入（非填充）
+        # prefix_ar_mask 存储自回归掩码，用于控制token之间的注意力关系
+        # prefix_tokens  存储处理后的token，包含图像和文本的特征表示
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        # 处理模型的后缀部分（状态和带噪声的动作）
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
+        #  将前缀和后缀的掩码在序列维度上拼接
+        # prefix_mask : 来自 embed_prefix 函数，包含了图像和文本输入的掩码
+        # suffix_mask : 来自 embed_suffix 函数，包含了状态和动作序列的掩码
+        # 拼接的目的：
+        # - 创建一个完整的输入掩码，覆盖整个序列（包括前缀和后缀部分）
+        # - 确保模型知道哪些位置是有效的输入，哪些是填充位置
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
+        
+        # 将前缀和后缀的自回归掩码拼接
+        # - prefix_ar_mask : 来自 embed_prefix 函数，控制图像和文本token之间的注意力关系
+        # - suffix_ar_mask : 来自 embed_suffix 函数，控制状态和动作token之间的注意力关系
+        # 拼接的目的：
+        # - 创建一个完整的自回归掩码，覆盖整个序列（包括前缀和后缀部分）
+        # - 维护了不同部分token之间的注意力流动规则
+        # - axis=0表示在序列维度上拼接，这保持了token的顺序：[图像tokens，文本tokens，状态tokens，动作tokens]
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
+        
+        # 生成注意力掩码，控制token之间的注意力关系，确保模型只在有效的token之间计算注意力
+        # TODO（tzhang）：两个mask如何生成有效的atten mask？
         attn_mask = make_attn_mask(input_mask, ar_mask)
+        
+        # 计算每个token的位置编码
         positions = jnp.cumsum(input_mask, axis=1) - 1
+        
+        # 通过语言模型处理前缀和后缀token
+        # prefix_tokens : 前缀序列，通常包含图像和文本的token表示
+        # suffix_tokens : 后缀序列，通常包含状态和动作的token表示
+        # attn_mask     : 注意力掩码，用于控制不同token之间的注意力关系
+        # positions     : 位置编码，帮助模型理解序列中token的相对位置
+        # input_mask    : 输入掩码，用于标记有效输入
+        # prefix_out为什么没有被使用？
+        # 因为扩散模型的训练过程中，我们的主要目标是预测动作序列的噪声，动作序列的信息都在 suffix_out 中，所以不需要额外使用它。
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
+        
+        # 从后缀输出中提取动作相关的部分，并通过投影层得到预测值
+        # 这里使用 -self.action_horizon 是因为：
+        # 1. suffix_out 包含了动作token的输出
+        # 2. 动作token位于序列的最后 action_horizon 个位置
+        # 3. 我们只需要这些动作相关的输出来进行噪声预测
+        # 4. 通过 action_out_proj 将高维特征投影到动作空间维度
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
+        # 计算预测值与目标值之间的均方误差，并在动作维度上取平均
+        # v_t 是模型预测的噪声值
+        # u_t 是实际的噪声值
+        # v_t - u_t 的含义：表示模型预测的噪声与实际噪声之间的误差
+        # jnp.square(v_t - u_t)：计算预测误差的平方，这是一个常见的均方误差(MSE)损失的组成部分
+        # 这个损失函数的意义：
+        # - 它衡量了模型在预测噪声时的准确程度
+        # - 损失值越小，表示模型越准确地预测出动作序列中的噪声
+        # - 在训练过程中，模型会通过最小化这个损失来学习如何更好地去噪
         return jnp.mean(jnp.square(v_t - u_t), axis=-1)
 
     @override

@@ -19,6 +19,30 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+# Gemma模型的PyTorch实现
+# 本脚本实现了Google的Gemma语言模型的PyTorch版本。Gemma是一个高效的大型语言模型，基于Transformer架构，具有以下特点：
+#     使用RMSNorm进行层归一化
+#     支持旋转位置编码(RoPE)
+#     实现了多头注意力机制
+#     支持自回归生成
+#     支持序列分类和标记分类任务
+#     支持缓存机制以加速推理
+#     支持梯度检查点以节省内存
+#     支持ADARMS（自适应RMSNorm）进行条件控制
+
+# 该实现包括以下主要组件：
+#     GemmaRMSNorm: 实现RMS归一化，支持自适应条件控制
+#     GemmaMLP: 实现前馈神经网络
+#     GemmaRotaryEmbedding: 实现旋转位置编码
+#     GemmaAttention: 实现多头注意力机制
+#     GemmaDecoderLayer: 实现Transformer解码器层
+#     GemmaModel: 实现基础模型
+#     GemmaForCausalLM: 实现用于因果语言建模的模型
+#     GemmaForSequenceClassification: 实现用于序列分类的模型
+#     GemmaForTokenClassification: 实现用于标记分类的模型
+
+
 from typing import Callable, Optional, Union
 
 import torch

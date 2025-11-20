@@ -1,3 +1,18 @@
+# OpenPI模型JAX训练脚本
+
+# 这个脚本实现了基于JAX和Flax的神经网络模型训练流程。主要功能包括：
+
+#     初始化训练环境和日志系统
+#     配置Weights & Biases (wandb)进行实验跟踪
+#     加载和验证预训练权重
+#     初始化训练状态和优化器
+#     实现训练步骤，包括前向传播、损失计算、梯度更新等
+#     支持分布式训练和模型分片
+#     实现检查点保存和恢复功能
+#     提供训练进度可视化
+
+# 该脚本主要用于训练机器人控制策略模型，支持从观察数据预测动作。
+
 import dataclasses
 import functools
 import logging
@@ -135,37 +150,43 @@ def init_train_state(
 
 @at.typecheck
 def train_step(
-    config: _config.TrainConfig,
-    rng: at.KeyArrayLike,
-    state: training_utils.TrainState,
-    batch: tuple[_model.Observation, _model.Actions],
+    config: _config.TrainConfig,    # 训练配置参数
+    rng: at.KeyArrayLike,   # 随机数生成器
+    state: training_utils.TrainState,   # 训练状态，包含模型参数、优化器状态等
+    batch: tuple[_model.Observation, _model.Actions],   # 训练数据，包含观察和动作
 ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
+    """Run a single training step."""
+    # 将模型定义和参数合并成一个完整的模型
     model = nnx.merge(state.model_def, state.params)
-    model.train()
+    model.train()   # 设置模型为训练模式
 
     @at.typecheck
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
-        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-        return jnp.mean(chunked_loss)
+        chunked_loss = model.compute_loss(rng, observation, actions, train=True)    # 计算损失，train=True表示在训练模式下计算
+        return jnp.mean(chunked_loss)   # 返回、计算平均损失
 
-    train_rng = jax.random.fold_in(rng, state.step)
-    observation, actions = batch
+    train_rng = jax.random.fold_in(rng, state.step) # 为当前训练步骤生成新的随机数
+    observation, actions = batch    # 解包数据，获取训练数据，观察和动作
 
     # Filter out frozen params.
-    diff_state = nnx.DiffState(0, config.trainable_filter)
+    diff_state = nnx.DiffState(0, config.trainable_filter)  # 创建可训练参数的过滤状态
+    # 计算损失和梯度，使用value_and_grad同时计算损失值和梯度
     loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions)
 
-    params = state.params.filter(config.trainable_filter)
-    updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
-    new_params = optax.apply_updates(params, updates)
+    params = state.params.filter(config.trainable_filter)   # 获取当前可训练参数
+    updates, new_opt_state = state.tx.update(grads, state.opt_state, params)    #使用优化器更新参数，获取参数更新和新的优化器状态
+    new_params = optax.apply_updates(params, updates)   # 应用参数更新
 
     # Update the model in place and return the new full state.
+    # 更新模型参数，并返回新的完整状态
     nnx.update(model, new_params)
     new_params = nnx.state(model)
 
+    # 创建新的训练状态，包含新的参数、优化器状态、步数等
     new_state = dataclasses.replace(state, step=state.step + 1, params=new_params, opt_state=new_opt_state)
+    # 如果启用了指数移动平均（EMA），则更新EMA参数
     if state.ema_decay is not None:
         new_state = dataclasses.replace(
             new_state,
@@ -175,6 +196,7 @@ def train_step(
         )
 
     # Filter out params that aren't kernels.
+    # 过滤出kernel参数（用于监控），排除bias、scale等参数，只保留维度大于1的参数
     kernel_params = nnx.state(
         model,
         nnx.All(
@@ -183,12 +205,13 @@ def train_step(
             lambda _, x: x.value.ndim > 1,
         ),
     )
+    # 收集训练信息在，包括损失值、梯度范数和参数范数
     info = {
-        "loss": loss,
-        "grad_norm": optax.global_norm(grads),
-        "param_norm": optax.global_norm(kernel_params),
+        "loss": loss,   # 当前步数的损失值
+        "grad_norm": optax.global_norm(grads),  # 梯度的全局范数
+        "param_norm": optax.global_norm(kernel_params), # 参数的全局范数
     }
-    return new_state, info
+    return new_state, info  # 返回新的训练状态和训练信息
 
 
 def main(config: _config.TrainConfig):

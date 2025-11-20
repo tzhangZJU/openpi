@@ -13,6 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """PyTorch PaliGemmamodel."""
+# PaliGemma模型的PyTorch实现
+
+# 本脚本实现了PaliGemma多模态模型，这是一个结合了视觉和语言能力的模型。
+# PaliGemma由视觉编码器（Vision Tower）和语言模型组成，能够处理图像和文本输入，并生成与两种模态相关的文本输出。主要功能包括：
+#     图像特征提取：使用视觉编码器从图像中提取特征
+#     多模态投影：将视觉特征投影到与语言模型兼容的空间
+#     文本生成：基于图像和文本输入生成相关文本
+#     条件生成：支持基于图像和提示文本的条件文本生成
+
+# 模型架构包括：
+#     视觉塔（Vision Tower）：处理图像输入
+#     多模态投影器：连接视觉和语言模型
+#     语言模型：处理文本和融合的图像特征
+#     语言模型头：用于生成文本输出
+# 该实现支持推理和微调，但不建议从头开始训练。
 
 from dataclasses import dataclass
 from typing import Optional, Union

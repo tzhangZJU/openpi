@@ -13,6 +13,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """PyTorch Siglip model."""
+# 本脚本实现了 Google SigLIP（Sigmoid Loss for Language-Image Pre-training）的 PyTorch 版本模型及其相关组件，
+
+# 用于图文对齐、特征抽取与图像分类等任务。核心功能包括：
+#     参数初始化：提供截断正态分布、方差缩放等权重初始化方法，保证不同层的稳定训练与数值范围控制；
+#     模型输出数据结构：定义文本和视觉模型的标准输出（包含最后隐状态、注意力、池化结果等），以及图文对比学习的输出封装；
+#     视觉嵌入与文本嵌入：实现图像分块卷积嵌入与位置编码插值、文本 token 嵌入与位置嵌入；
+#     注意力与 MLP 层：实现多头自注意力、MLP 前馈层、归一化、残差连接等 Transformer 基础组件；
+#     编码器与变压器：实现通用编码器（多层堆叠的注意力 + MLP）、文本与视觉 Transformer 结构；
+#     视觉池化头：实现多头注意力池化，将 patch token 聚合为图像全局特征；
+#     顶层模型：包含纯文本模型、纯视觉模型、联合图文模型（计算图文相似度与对比损失）、以及图像分类模型；
+#     注意力实现切换：支持 PyTorch SDPA、FlashAttention2、以及自定义 eager 注意力等后端选择；
+
+# 使用场景：
+#     获取文本或图像的投影后的嵌入特征（get_text_features() / get_image_features()）；
+#     进行图文匹配/对比学习，计算图文相似度与对比损失（SiglipModel.forward）；
+#     对图像进行分类任务（SiglipForImageClassification）。
+
+# 模块组成与依赖：
+#     依赖 Transformers 风格的模型工具（输出结构、装饰器、日志等）与 PyTorch 张量/模块；
+#     提供清晰的输入/输出约定与多种注意力后端的兼容支持。
+
 
 import math
 import warnings

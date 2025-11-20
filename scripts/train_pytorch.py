@@ -22,6 +22,19 @@ Multi-Node Training:
     scripts/train_pytorch.py <config_name> --exp_name=<run_name> --save_interval <interval>
 
 """
+# 本脚本是 OpenPI 项目中使用 PyTorch 训练 PIO/PIO5 模型的统一入口，支持单机单卡、单机多卡（DDP）以及多机多卡分布式训练。其目标是与 JAX 版本的训练脚本 scripts/train.py 行为保持一致，
+# 但完全基于 PyTorch 实现，复用统一的配置与数据加载管线（见 src/openpi/training/config.py 与 src/openpi/training/data_loader.py）。
+
+# 主要能力：
+
+#     基于 torch.distributed 的 DDP 启动与清理；
+#     使用统一数据加载器创建 PyTorch 数据集/批次迭代；
+#     构建 'PIOPytorch' 模型，支持梯度检查点、权重加载与精度配置；
+#     自适应学习率调度（含 warmup 与余弦退火）；
+#     断点续训（模型、优化器、训练元数据原子化保存/恢复）；
+#     与 Weights & Biases 的训练过程可视化与文件追踪整合。
+
+# 适用场景：需要在 GPU/多机环境下稳定训练 PIO/PIO5 模型，并希望在不依赖 JAX 的情况下快速上手。
 
 import dataclasses
 import gc

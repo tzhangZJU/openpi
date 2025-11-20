@@ -1,3 +1,11 @@
+# 该脚本用于将已训练好的策略（policy）通过 WebSocket 服务暴露出来，方便外部客户端进行推理调用或行为录制。脚本支持从默认环境映射的检查点（checkpoint）
+# 或用户显式指定的检查点加载策略，并可选开启录制模式以保存策略执行轨迹，便于调试与蒸馏数据采集。
+
+# 支持两种策略来源：
+
+#     默认内置的各环境预训练 checkpoint
+#     用户显式指定的训练配置名与 checkpoint 目录
+
 import dataclasses
 import enum
 import logging
