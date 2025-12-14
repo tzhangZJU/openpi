@@ -1,3 +1,22 @@
+"""
+模型基础模块 - 提供OpenPI模型的核心接口和数据结构
+
+本模块定义了：
+1. 模型类型枚举（ModelType）- 支持的模型变体
+2. 观察数据结构（Observation）- 统一的多模态输入格式
+3. 动作数据类型（Actions）- 动作序列的标准表示
+4. 模型配置基类（BaseModelConfig）- 所有模型的配置接口
+5. 模型基类（BaseModel）- 所有模型实现的抽象基类
+6. 工具函数：
+   - preprocess_observation: 观察数据预处理（图像增强、调整大小等）
+   - restore_params: 从检查点恢复模型参数
+
+核心设计原则：
+- 统一的数据格式：所有模型使用相同的Observation和Actions数据结构
+- 多框架支持：同时支持JAX和PyTorch实现
+- 类型安全：使用类型注解和运行时类型检查
+- 可扩展性：通过抽象基类支持新模型的添加
+"""
 import abc
 from collections.abc import Sequence
 import dataclasses
@@ -28,7 +47,17 @@ ArrayT = TypeVar("ArrayT", bound=jax.Array | torch.Tensor | np.ndarray)
 
 
 class ModelType(enum.Enum):
-    """Supported model types."""
+    """Supported model types.
+
+    支持的模型类型枚举
+
+    - PI0: 基础版本的Pi0模型，使用扩散模型进行动作预测
+      Base version of Pi0 model, using diffusion model for action prediction
+    - PI0_FAST: Pi0的快速变体，使用自回归token生成
+      Fast variant of Pi0, using autoregressive token generation
+    - PI05: Pi0.5版本，引入了AdaRMS（自适应RMS归一化）机制
+      Pi0.5 version, introducing AdaRMS (Adaptive RMS normalization) mechanism
+    """
 
     PI0 = "pi0"
     PI0_FAST = "pi0_fast"
@@ -36,6 +65,9 @@ class ModelType(enum.Enum):
 
 
 # The model always expects these images
+# 模型默认期望的图像输入键名
+# 这三个视角分别对应：基座摄像头、左手腕摄像头、右手腕摄像头
+# These three views correspond to: base camera, left wrist camera, right wrist camera
 IMAGE_KEYS = (
     "base_0_rgb",
     "left_wrist_0_rgb",
@@ -44,71 +76,148 @@ IMAGE_KEYS = (
 
 
 # This may need change if we release a small model.
+# 模型输入图像的标准分辨率 (高度, 宽度)
+# 注意：如果发布小模型，这个分辨率可能会改变
 IMAGE_RESOLUTION = (224, 224)
 
 
 # Data format
+# 数据格式说明
 #
 # Data transforms produce the model input as a nested dictionary which is later converted
-# into `Obesrvation` and `Actions` objects. See below.
+# into `Observation` and `Actions` objects. See below.
+# 数据变换（transforms）产生的模型输入是一个嵌套字典，随后会被转换为 `Observation` 和 `Actions` 对象。
 #
-# In the dictory form, this data should look like:
+# In the dictionary form, this data should look like:
+# 在字典形式中，数据结构应该如下所示：
 # {
 #     # Observation data.
+#     # 观察数据部分
 #     "image": {
 #         "base_0_rgb": (float32|uint8)[*b, h, w, 3],  # RGB image in [-1, 1] or [0, 255]
-#         ...  # Additional camera views
+#                                                        # RGB图像，范围在[-1, 1]或[0, 255]
+#         ...  # Additional camera views / 其他摄像头视角
 #     },
 #     "image_mask": {
-#         "base_0_rgb": bool[*b],  # True if image is valid
-#         ...  # Masks for additional views
+#         "base_0_rgb": bool[*b],  # True if image is valid / True表示图像有效，False表示填充
+#         ...  # Masks for additional views / 其他视角的掩码
 #     },
-#     "state": float32[*b, s],  # Low-dimensional robot state
-#     "tokenized_prompt": int32[*b, l],  # Optional, tokenized language prompt
-#     "tokenized_prompt_mask": bool[*b, l],  # Optional, mask for tokenized prompt
-#     "token_ar_mask": int32[*b, l],  # Optional, autoregressive mask for FAST model
-#     "token_loss_mask": bool[*b, l],  # Optional, loss mask for FAST model
+#     "state": float32[*b, s],  # Low-dimensional robot state / 低维机器人状态（关节角度、位置等）
+#     "tokenized_prompt": int32[*b, l],  # Optional, tokenized language prompt / 可选，分词后的语言提示
+#     "tokenized_prompt_mask": bool[*b, l],  # Optional, mask for tokenized prompt / 可选，提示词的掩码
+#     "token_ar_mask": int32[*b, l],  # Optional, autoregressive mask for FAST model / 可选，FAST模型的自回归掩码
+#     "token_loss_mask": bool[*b, l],  # Optional, loss mask for FAST model / 可选，FAST模型的损失掩码
 #
-#      # Actions data.
-#      "actions": float32[*b ah ad]
+#      # Actions data. / 动作数据部分
+#      "actions": float32[*b, ah, ad]  # 动作序列
 # }
-# where:
-#   *b = batch dimensions
-#   h,w = image height/width
-#   s = state dimension
-#   l = sequence length
+# where: / 其中：
+#   *b = batch dimensions / 批次维度（可能有多个）
+#   h, w = image height/width / 图像高度/宽度
+#   s = state dimension / 状态维度
+#   l = sequence length / 序列长度
+#   ah = action_horizon / 动作序列长度
+#   ad = action_dim / 动作维度
 #
 @at.typecheck
 @struct.dataclass
 class Observation(Generic[ArrayT]):
     """Holds observations, i.e., inputs to the model.
 
+    观察数据结构 - 存储模型的所有输入信息
+
+    Observation类封装了机器人的多模态观察数据，包括：
+    Observation class encapsulates multi-modal robotic observation data, including:
+    - 多视角图像：来自不同摄像头的RGB图像
+      Multi-view images: RGB images from different cameras
+    - 图像掩码：标识哪些图像视角是有效的
+      Image masks: Identify which image views are valid
+    - 机器人状态：关节角度、末端执行器位置等低维状态
+      Robot state: Low-dimensional state such as joint angles, end-effector positions
+    - 语言指令：可选的自然语言任务描述（已分词）
+      Language instructions: Optional natural language task descriptions (tokenized)
+
+    数据类型参数 / Type parameter:
+        ArrayT: 数组类型，可以是JAX数组、PyTorch张量或NumPy数组
+                Array type, can be JAX array, PyTorch tensor, or NumPy array
+
+    使用方法 / Usage:
+        1. 从字典创建：Observation.from_dict(data_dict)
+           Create from dict: Observation.from_dict(data_dict)
+        2. 转换为字典：observation.to_dict()
+           Convert to dict: observation.to_dict()
+
     See `Observation.from_dict` to see the expected dictionary form. This is the format
     that should be produced by the data transforms.
+    参考 `Observation.from_dict` 方法查看预期的字典格式。
+    这是数据变换（transforms）应该产生的格式。
     """
 
     # Images, in [-1, 1] float32.
+    # 图像数据，范围在 [-1, 1] 的 float32
+    # 键为摄像头名称（如 "base_0_rgb"），值为对应的图像数组
+    # Keys are camera names (e.g., "base_0_rgb"), values are corresponding image arrays
     images: dict[str, at.Float[ArrayT, "*b h w c"]]
+
     # Image masks, with same keys as images.
+    # 图像掩码，键与 images 相同
+    # True 表示该图像有效，False 表示填充或无效数据
+    # True indicates valid image, False indicates padding or invalid data
     image_masks: dict[str, at.Bool[ArrayT, "*b"]]
+
     # Low-dimensional robot state.
+    # 低维机器人状态向量
+    # 通常包含关节角度、末端执行器位置等信息
+    # Usually contains joint angles, end-effector positions, etc.
     state: at.Float[ArrayT, "*b s"]
 
     # Tokenized prompt.
+    # 分词后的语言提示（可选）
+    # 用于语言条件的策略学习
+    # For language-conditioned policy learning
     tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
+
     # Tokenized prompt mask.
+    # 提示词掩码（可选）
+    # 标识提示词序列中哪些token是有效的
+    # Identifies which tokens in the prompt sequence are valid
     tokenized_prompt_mask: at.Bool[ArrayT, "*b l"] | None = None
 
     # pi0-fast model specific fields.
+    # pi0-fast 模型特定字段
 
     # Token auto-regressive mask (for FAST autoregressive model).
+    # Token自回归掩码（用于FAST自回归模型）
+    # 控制自回归生成过程中的依赖关系
+    # Controls dependencies in the autoregressive generation process
     token_ar_mask: at.Int[ArrayT, "*b l"] | None = None
+
     # Token loss mask (for FAST autoregressive model).
+    # Token损失掩码（用于FAST自回归模型）
+    # 标识在训练时哪些token应该参与损失计算
+    # Identifies which tokens should participate in loss calculation during training
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
-        """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
+        """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format.
+
+        从嵌套字典创建Observation对象
+        此方法定义了非结构化数据（嵌套字典）到结构化Observation格式的映射。
+
+        参数 / Args:
+            data: 包含观察数据的嵌套字典，应符合上述数据格式说明
+                  Nested dictionary containing observation data, should conform to the data format description above
+
+        返回 / Returns:
+            Observation对象 / Observation object
+
+        注意 / Note:
+            - tokenized_prompt 和 tokenized_prompt_mask 必须同时提供或同时缺失
+              tokenized_prompt and tokenized_prompt_mask must be provided together
+            - uint8类型的图像会自动转换为[-1, 1]范围的float32
+              uint8 images are automatically converted to [-1, 1] float32
+        """
         # Ensure that tokenized_prompt and tokenized_prompt_mask are provided together.
         if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
             raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
@@ -129,7 +238,14 @@ class Observation(Generic[ArrayT]):
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
-        """Convert the Observation to a nested dict."""
+        """Convert the Observation to a nested dict.
+
+        将Observation转换为嵌套字典
+
+        返回 / Returns:
+            包含所有观察数据的嵌套字典
+            Nested dictionary containing all observation data
+        """
         result = dataclasses.asdict(self)
         result["image"] = result.pop("images")
         result["image_mask"] = result.pop("image_masks")
@@ -138,6 +254,10 @@ class Observation(Generic[ArrayT]):
 
 # Defines the format of the actions. This field is included as "actions" inside the dictionary
 # produced by the data transforms.
+# 动作数据类型定义
+# 表示动作序列：[批次维度, 动作序列长度, 动作维度]
+# 这个字段在数据变换产生的字典中以 "actions" 键存储
+# Represents action sequence: [batch dimensions, action_horizon, action_dim]
 Actions = at.Float[ArrayT, "*b ah ad"]
 
 
@@ -266,28 +386,64 @@ def preprocess_observation(
 
 @dataclasses.dataclass(frozen=True)
 class BaseModelConfig(abc.ABC):
-    """Configuration shared by all models. Specific models should inherit from this class, and implement the `create`
-    method to create the corresponding model.
+    """模型配置基类 - 所有模型配置必须继承此类
+
+    此抽象基类定义了所有OpenPI模型共享的配置参数和接口。
+    具体模型应该继承此类，并实现 `create` 方法来创建对应的模型实例。
+
+    配置参数:
+        action_dim: 动作空间维度（例如：机器人关节数量）
+        action_horizon: 动作序列长度（预测未来多少步）
+        max_token_len: 分词提示词的最大长度
+
+    必须实现的抽象方法:
+        model_type: 返回模型类型枚举
+        create: 创建并初始化新模型
+        inputs_spec: 返回模型输入规范
+
+    提供的工具方法:
+        load: 从参数字典加载模型
+        load_pytorch: 加载PyTorch模型
+        fake_obs: 生成虚拟观察数据（用于测试）
+        fake_act: 生成虚拟动作数据（用于测试）
     """
 
-    # Action space dimension.
+    # 动作空间维度
     action_dim: int
-    # Action sequence length.
+    # 动作序列长度
     action_horizon: int
-    # Tokenized prompt maximum length.
+    # 分词提示词最大长度
     max_token_len: int
 
     @property
     @abc.abstractmethod
     def model_type(self) -> ModelType:
-        """The model type."""
+        """返回模型类型枚举"""
 
     @abc.abstractmethod
     def create(self, rng: at.KeyArrayLike) -> "BaseModel":
-        """Create a new model, initializing parameters."""
+        """创建新模型，初始化参数
+
+        参数:
+            rng: JAX随机数生成器，用于参数初始化
+
+        返回:
+            初始化后的模型实例
+        """
 
     def load(self, params: at.Params, *, remove_extra_params: bool = True) -> "BaseModel":
-        """Create a model with the given parameters."""
+        """从参数字典创建模型
+
+        参数:
+            params: 模型参数字典（PyTree格式）
+            remove_extra_params: 是否移除额外的参数（不在模型中的参数）
+
+        返回:
+            加载了指定参数的模型实例
+
+        注意:
+            此方法会检查参数的形状是否匹配，但不检查数据类型
+        """
         model = nnx.eval_shape(self.create, jax.random.key(0))
         graphdef, state = nnx.split(model)
         if remove_extra_params:
@@ -297,6 +453,15 @@ class BaseModelConfig(abc.ABC):
         return nnx.merge(graphdef, state)
 
     def load_pytorch(self, train_config, weight_path: str):
+        """加载PyTorch模型
+
+        参数:
+            train_config: 训练配置对象
+            weight_path: 权重文件路径
+
+        返回:
+            加载了权重的PyTorch模型
+        """
         logger.info(f"train_config: {train_config}")
         model = pi0_pytorch.PI0Pytorch(config=train_config.model)
         safetensors.torch.load_model(model, weight_path)
@@ -304,21 +469,55 @@ class BaseModelConfig(abc.ABC):
 
     @abc.abstractmethod
     def inputs_spec(self, *, batch_size: int = 1) -> tuple[Observation, Actions]:
-        """Returns the input specification for the model. Values are jax.ShapeDtypeStruct."""
+        """返回模型输入规范
+
+        参数:
+            batch_size: 批次大小
+
+        返回:
+            (observation_spec, action_spec) 元组，值为 jax.ShapeDtypeStruct
+        """
 
     def fake_obs(self, batch_size: int = 1) -> Observation:
+        """生成虚拟观察数据（用于测试）
+
+        参数:
+            batch_size: 批次大小
+
+        返回:
+            填充了全1的观察数据
+        """
         observation_spec, _ = self.inputs_spec(batch_size=batch_size)
         return jax.tree.map(lambda x: jnp.ones(x.shape, x.dtype), observation_spec)
 
     def fake_act(self, batch_size: int = 1) -> Actions:
+        """生成虚拟动作数据（用于测试）
+
+        参数:
+            batch_size: 批次大小
+
+        返回:
+            填充了全1的动作数据
+        """
         _, action_spec = self.inputs_spec(batch_size=batch_size)
         return jax.tree.map(lambda x: jnp.ones(x.shape, x.dtype), action_spec)
 
 
 @dataclasses.dataclass
 class BaseModel(nnx.Module, abc.ABC):
-    """Base class for all model implementations. Specific models should inherit from this class. They should call
-    super().__init__() to initialize the shared attributes (action_dim, action_horizon, and max_token_len).
+    """模型基类 - 所有模型实现必须继承此类
+
+    此抽象基类定义了所有OpenPI模型的核心接口。
+    具体模型应该继承此类，并实现抽象方法。
+
+    子类必须调用 super().__init__() 来初始化共享属性：
+    - action_dim: 动作空间维度
+    - action_horizon: 动作序列长度
+    - max_token_len: 分词提示词最大长度
+
+    必须实现的抽象方法:
+        compute_loss: 计算训练损失
+        sample_actions: 从观察数据采样动作序列
     """
 
     action_dim: int
@@ -333,10 +532,33 @@ class BaseModel(nnx.Module, abc.ABC):
         actions: Actions,
         *,
         train: bool = False,
-    ) -> at.Float[at.Array, "*b ah"]: ...
+    ) -> at.Float[at.Array, "*b ah"]:
+        """计算模型损失
+
+        参数:
+            rng: JAX随机数生成器
+            observation: 观察数据
+            actions: 目标动作序列
+            train: 是否为训练模式（影响dropout等）
+
+        返回:
+            每个样本的损失值，形状为 [*batch_size, action_horizon]
+        """
+        ...
 
     @abc.abstractmethod
-    def sample_actions(self, rng: at.KeyArrayLike, observation: Observation, **kwargs) -> Actions: ...
+    def sample_actions(self, rng: at.KeyArrayLike, observation: Observation, **kwargs) -> Actions:
+        """从观察数据采样动作序列
+
+        参数:
+            rng: JAX随机数生成器（用于采样过程）
+            observation: 当前观察数据
+            **kwargs: 模型特定的采样参数
+
+        返回:
+            采样的动作序列
+        """
+        ...
 
 
 def restore_params(

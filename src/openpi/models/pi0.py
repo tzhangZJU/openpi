@@ -1,3 +1,33 @@
+"""
+Pi0模型实现 - 基于扩散模型的机器人策略模型
+
+本模块实现了Pi0模型，这是一个用于机器人控制的多模态扩散模型。
+
+核心组件：
+1. Pi0: 主模型类，继承自BaseModel
+2. make_attn_mask: 注意力掩码生成函数
+3. posemb_sincos: 正弦余弦位置编码
+
+模型架构：
+- 视觉编码器：SigLIP，处理多视角RGB图像
+- 语言模型：PaliGemma，处理视觉特征和文本提示
+- 动作专家：基于Gemma的动作序列预测模块
+- 扩散过程：使用流匹配（Flow Matching）进行动作生成
+
+训练过程：
+1. 添加噪声到目标动作序列
+2. 模型预测噪声方向（velocity field）
+3. 通过最小化预测与真实噪声的MSE进行优化
+
+推理过程：
+1. 从纯噪声开始
+2. 使用ODE求解器迭代去噪
+3. 得到最终的动作序列预测
+
+版本说明：
+- Pi0: 基础版本，使用MLP混合时间步和动作信息
+- Pi0.5: 改进版本，使用AdaRMS（自适应RMS归一化）机制
+"""
 import logging
 
 import einops
@@ -17,25 +47,36 @@ logger = logging.getLogger("openpi")
 
 
 def make_attn_mask(input_mask, mask_ar):
-    """Adapted from big_vision.
+    """生成注意力掩码矩阵，控制token之间的注意力关系
 
-    Tokens can attend to valid inputs tokens which have a cumulative mask_ar
-    smaller or equal to theirs. This way `mask_ar` bool[?B, N] can be used to
-    setup several types of attention, for example:
+    此函数改编自 big_vision 库，用于创建灵活的注意力掩码。
+    Token可以attend到所有有效的输入token，且这些token的累积mask_ar值
+    小于或等于自身的累积mask_ar值。
 
-      [[1 1 1 1 1 1]]: pure causal attention.
+    通过mask_ar，可以设置多种注意力模式：
 
-      [[0 0 0 1 1 1]]: prefix-lm attention. The first 3 tokens can attend between
-          themselves and the last 3 tokens have a causal attention. The first
-          entry could also be a 1 without changing behaviour.
+    示例：
+        [[1 1 1 1 1 1]]: 纯因果注意力（每个token只能看到之前的token）
 
-      [[1 0 1 0 1 0 0 1 0 0]]: causal attention between 4 blocks. Tokens of a
-          block can attend all previous blocks and all tokens on the same block.
+        [[0 0 0 1 1 1]]: 前缀-LM注意力
+            - 前3个token可以互相attend（双向注意力）
+            - 后3个token使用因果注意力
+            - 第一个位置也可以设为1而不改变行为
 
-    Args:
-      input_mask: bool[B, N] true if its part of the input, false if padding.
-      mask_ar: bool[?B, N] mask that's true where previous tokens cannot depend on
-        it and false where it shares the same attention mask as the previous token.
+        [[1 0 1 0 1 0 0 1 0 0]]: 4个块之间的因果注意力
+            - 同一块内的token可以互相attend
+            - 每个块可以attend到所有之前的块
+
+    参数:
+        input_mask: bool[B, N] - True表示该位置是有效输入，False表示填充
+        mask_ar: bool[?B, N] - True表示前面的token不能依赖它（因果边界），
+                               False表示与前一个token共享注意力掩码
+
+    返回:
+        bool[B, N, N] - 注意力掩码矩阵，True表示允许attend
+
+    注意:
+        mask_ar会广播到与input_mask相同的形状
     """
     mask_ar = jnp.broadcast_to(mask_ar, input_mask.shape)
     cumsum = jnp.cumsum(mask_ar, axis=1)
@@ -48,7 +89,29 @@ def make_attn_mask(input_mask, mask_ar):
 def posemb_sincos(
     pos: at.Real[at.Array, " b"], embedding_dim: int, min_period: float, max_period: float
 ) -> at.Float[at.Array, "b {embedding_dim}"]:
-    """Computes sine-cosine positional embedding vectors for scalar positions."""
+    """计算标量位置的正弦-余弦位置编码向量
+
+    使用正弦和余弦函数生成位置编码，类似于Transformer中的位置编码。
+    不同频率的正弦余弦波可以帮助模型学习位置信息和时间依赖关系。
+
+    参数:
+        pos: 位置标量数组，形状 [batch_size]
+        embedding_dim: 嵌入维度，必须是偶数（一半用于sin，一半用于cos）
+        min_period: 最小周期（对应最高频率）
+        max_period: 最大周期（对应最低频率）
+
+    返回:
+        位置编码向量，形状 [batch_size, embedding_dim]
+
+    实现细节:
+        - 前 embedding_dim//2 维使用正弦函数
+        - 后 embedding_dim//2 维使用余弦函数
+        - 频率从高到低呈指数分布
+        - 使用HIGHEST精度进行计算以保证数值稳定性
+
+    抛出:
+        ValueError: 如果 embedding_dim 不是偶数
+    """
     if embedding_dim % 2 != 0:
         raise ValueError(f"embedding_dim ({embedding_dim}) must be divisible by 2")
 
@@ -305,42 +368,77 @@ class Pi0(_model.BaseModel):
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
     ) -> _model.Actions:
+        """从观察数据采样动作序列（推理阶段）
+
+        使用ODE求解器从噪声逐步去噪，生成动作序列。
+        这是扩散模型的逆向过程。
+
+        参数:
+            rng: JAX随机数生成器，用于初始化噪声（如果未提供noise参数）
+            observation: 当前观察数据，包含图像、状态等信息
+            num_steps: ODE求解器的步数，越多越精确但速度越慢（默认10）
+            noise: 可选的初始噪声，如果为None则随机采样
+
+        返回:
+            预测的动作序列，形状 [batch_size, action_horizon, action_dim]
+
+        实现细节:
+            1. 预处理观察数据（图像调整大小等）
+            2. 使用前缀（视觉+语言）填充KV缓存，避免重复计算
+            3. 从纯噪声（t=1）开始迭代去噪到干净动作（t=0）
+            4. 每步预测速度场（velocity field），沿ODE轨迹前进
+
+        注意:
+            - 时间约定与论文相反：t=1是噪声，t=0是目标分布
+            - 使用while_loop进行高效的JIT编译
+        """
         observation = _model.preprocess_observation(None, observation, train=False)
-        # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
-        # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
+        # 注意：使用扩散文献中常见的约定，t=1是噪声，t=0是目标分布
+        # 是的，这与pi0论文相反，抱歉造成困惑
         dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]
         if noise is None:
             noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
 
-        # first fill KV cache with a forward pass of the prefix
+        # 首先用前缀的前向传播填充KV缓存
+        # 这样后续的迭代只需要处理后缀（动作）部分，大大提高效率
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
         def step(carry):
+            """ODE求解器的单步更新
+
+            参数:
+                carry: (x_t, time) 元组
+                    - x_t: 当前时间步的动作序列
+                    - time: 当前时间步 t ∈ [0, 1]
+
+            返回:
+                (x_{t+dt}, time+dt): 更新后的状态
+            """
             x_t, time = carry
+            # 嵌入后缀部分（状态和噪声动作）
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
                 observation, x_t, jnp.broadcast_to(time, batch_size)
             )
-            # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
-            # other
+            # `suffix_attn_mask` 形状 (b, suffix_len, suffix_len)，表示后缀token之间如何attend
             suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
-            # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
-            # prefix tokens
+            # `prefix_attn_mask` 形状 (b, suffix_len, prefix_len)，表示后缀token如何attend到前缀token
             prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
-            # `combined_mask` is shape (b, suffix_len, prefix_len + suffix_len) indicating how the suffix tokens (which
-            # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
+            # `full_attn_mask` 形状 (b, suffix_len, prefix_len + suffix_len)
+            # 表示后缀token（生成查询）如何attend到完整的前缀+后缀序列（生成键和值）
             full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
             assert full_attn_mask.shape == (
                 batch_size,
                 suffix_tokens.shape[1],
                 prefix_tokens.shape[1] + suffix_tokens.shape[1],
             )
-            # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
+            # `positions` 形状 (b, suffix_len)，表示后缀token的位置索引
             positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
 
+            # 前向传播，利用KV缓存避免重复计算前缀部分
             (prefix_out, suffix_out), _ = self.PaliGemma.llm(
                 [None, suffix_tokens],
                 mask=full_attn_mask,
@@ -349,14 +447,27 @@ class Pi0(_model.BaseModel):
                 adarms_cond=[None, adarms_cond],
             )
             assert prefix_out is None
+            # 从后缀输出中提取动作相关的token，投影到动作空间
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
+            # ODE更新：x_{t+dt} = x_t + dt * v_t
+            # 其中 v_t 是预测的速度场（velocity field）
             return x_t + dt * v_t, time + dt
 
         def cond(carry):
+            """循环终止条件
+
+            参数:
+                carry: (x_t, time) 元组
+
+            返回:
+                bool: 如果 time >= -dt/2 则继续循环（处理浮点误差）
+            """
             x_t, time = carry
-            # robust to floating-point error
+            # 鲁棒处理浮点误差
             return time >= -dt / 2
 
+        # 使用JAX的while_loop进行高效迭代
+        # 从 (噪声, t=1.0) 开始，迭代到 (干净动作, t≈0)
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
